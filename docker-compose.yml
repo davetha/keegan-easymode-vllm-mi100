@@ -1,0 +1,85 @@
+# Qwen3.8-27B INT8 on AMD MI100 - curvedinf/int8-vllm
+# Settings live in .env (generate one with: bash gen-env.sh)
+services:
+  vllm:
+    image: int8-vllm:mi100
+    build:
+      context: ${VLLM_DIR:-../int8-vllm}
+      dockerfile: docker/Dockerfile.mi100
+      args:
+        BASE_IMAGE: aiter-mi100:latest
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - video
+      - render
+    ipc: host
+    cap_add: [SYS_PTRACE]
+    security_opt: [seccomp=unconfined]
+    ports:
+      - "${PUBLISH_IP:-127.0.0.1}:${PORT:-8000}:8000"
+    volumes:
+      - ${MODELS_DIR:-./models}:/models
+      - ${AITER_DIR:-./aiter}:/opt/aiter
+      - hfcache:/root/.cache
+    environment:
+      PYTHONPATH: /opt/aiter
+      GPU_ARCHS: gfx908
+      HIP_VISIBLE_DEVICES: "${GPUS:-0,1}"
+      ROCR_VISIBLE_DEVICES: "${GPUS:-0,1}"
+      CUDA_VISIBLE_DEVICES: "${GPUS:-0,1}"
+      VLLM_ROCM_USE_AITER: "1"
+      VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION: "1"
+      VLLM_ROCM_USE_AITER_CUSTOM_AR: "0"
+      VLLM_GFX908_ACT_QUANT: round
+      VLLM_G128_GLUON: "1"
+      VLLM_TP_SAMPLE_SYNC: "1"
+      VLLM_DISABLED_KERNELS: TritonW8A16LinearKernel
+      VLLM_MI100_TORCH_COMPILE: "1"
+      VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: "1800"
+    command: >
+      vllm serve /models/target
+      --served-model-name qwen3.8-27b-gptq8
+      --tensor-parallel-size ${TP:-2}
+      --max-model-len ${MAX_MODEL_LEN:-32768}
+      --max-num-seqs ${MAX_NUM_SEQS:-6}
+      --gpu-memory-utilization ${GPU_MEM_UTIL:-0.92}
+      --dtype bfloat16
+      --kv-cache-dtype int8_block_g128
+      --mamba-ssm-cache-dtype float32
+      --language-model-only --skip-mm-profiling
+      --reasoning-parser qwen3
+      --enable-auto-tool-choice --tool-call-parser qwen3_coder
+      --default-chat-template-kwargs '{"enable_thinking":true,"reasoning_effort":"low"}'
+      --compilation-config '{"mode":3,"cudagraph_mode":"FULL_AND_PIECEWISE","pass_config":{"fuse_allreduce_rms":false}}'
+      --speculative-config '{"method":"dflash","model":"/models/draft","num_speculative_tokens":${NS:-6},"kv_cache_dtype":"int8_block_g128"}'
+      ${EXTRA_ARGS:-}
+    restart: unless-stopped
+    stop_grace_period: 2m
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 45m
+
+  # One-shot: downloads both models (~35 GB) + the int8-aiter kernel repo.
+  # Run once:  docker compose --profile setup run --rm downloader
+  downloader:
+    image: int8-vllm:mi100
+    profiles: [setup]
+    volumes:
+      - ${MODELS_DIR:-./models}:/models
+      - ${AITER_DIR:-./aiter}:/opt/aiter
+      - hfcache:/root/.cache
+    command: >
+      sh -c "
+      if [ ! -d /opt/aiter/.git ]; then git clone --branch main https://github.com/curvedinf/int8-aiter.git /opt/aiter; fi
+      && dl() { if command -v hf >/dev/null; then hf download \"$$1\" --local-dir \"$$2\"; else huggingface-cli download \"$$1\" --local-dir \"$$2\"; fi; }
+      && dl curvedinf/Qwen3.8-27B-GPTQ-INT8-W8A8-GS128-PTQR /models/target
+      && dl curvedinf/Qwen3.8-27B-DFlash2-GPTQ-INT8-W8A8-GS128-PTQR /models/draft
+      && echo DONE"
+
+volumes:
+  hfcache:
